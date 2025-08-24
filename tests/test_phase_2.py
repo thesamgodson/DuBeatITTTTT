@@ -28,7 +28,7 @@ class TestParticipantModules(unittest.TestCase):
 
         # 2. Test forward pass
         output = module(self.sample_input)
-        self.assertEqual(output.shape, (self.batch_size, 1), f"{module_name} output shape is incorrect.")
+        self.assertEqual(output.shape, (self.batch_size, self.hidden_dim), f"{module_name} output shape is incorrect.")
         self.assertFalse(torch.isnan(output).any(), f"{module_name} output contains NaN values.")
         print(f"✓ {module_name} forward pass successful.")
 
