@@ -19,13 +19,15 @@ class TrendBlock(nn.Module):
         self.p_backcast = torch.stack([t_backcast ** i for i in range(thetas_dim)], dim=0)
         self.p_forecast = torch.stack([t_forecast ** i for i in range(thetas_dim)], dim=0)
 
-    def forward(self, x: torch.Tensor, som_embedding: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, som_embedding: torch.Tensor = None, external_embedding: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
         x = torch.relu(self.fc4(x))
         if som_embedding is not None:
             x = x + som_embedding
+        if external_embedding is not None:
+            x = x + external_embedding
         theta_b = self.theta_b_fc(x)
         theta_f = self.theta_f_fc(x)
         backcast = torch.einsum('bp,pt->bt', theta_b, self.p_backcast)
@@ -56,13 +58,15 @@ class SeasonalityBlock(nn.Module):
         s_forecast_sin = torch.sin(2 * torch.pi * harmonics[:, None] * t_forecast[None, :])
         self.s_forecast = torch.cat([s_forecast_cos, s_forecast_sin], dim=0)
 
-    def forward(self, x: torch.Tensor, som_embedding: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, som_embedding: torch.Tensor = None, external_embedding: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
         x = torch.relu(self.fc4(x))
         if som_embedding is not None:
             x = x + som_embedding
+        if external_embedding is not None:
+            x = x + external_embedding
         theta_b = self.theta_b_fc(x)
         theta_f = self.theta_f_fc(x)
         backcast = torch.einsum('bp,pt->bt', theta_b, self.s_backcast)
@@ -82,13 +86,15 @@ class GenericBlock(nn.Module):
         self.backcast_layer = nn.Linear(units, backcast_length)
         self.forecast_layer = nn.Linear(units, forecast_length)
 
-    def forward(self, x: torch.Tensor, som_embedding: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, som_embedding: torch.Tensor = None, external_embedding: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
         x = torch.relu(self.fc4(x))
         if som_embedding is not None:
             x = x + som_embedding
+        if external_embedding is not None:
+            x = x + external_embedding
         backcast = self.backcast_layer(x)
         forecast = self.forecast_layer(x)
         return backcast, forecast
