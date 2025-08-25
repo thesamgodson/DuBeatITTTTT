@@ -32,6 +32,11 @@ class MarketDataReader:
                 print(f"Loading and processing data for {asset}...")
                 # 1. Load raw data
                 raw_df = yf.download(asset, start=self.start_date, end=self.end_date, auto_adjust=True)
+
+                # FIX: Flatten MultiIndex columns returned by yfinance
+                if isinstance(raw_df.columns, pd.MultiIndex):
+                    raw_df.columns = raw_df.columns.get_level_values(0)
+
                 if raw_df.empty:
                     print(f"Warning: No data found for {asset}. Skipping.")
                     continue
