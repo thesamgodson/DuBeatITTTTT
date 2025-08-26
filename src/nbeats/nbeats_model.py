@@ -113,12 +113,12 @@ class NBEATSWithSOM(nn.Module):
             som_feature_size = self.som_feature_extractor.extract_features(dummy_som_input).shape[1]
             self.gate_layer = nn.Linear(som_feature_size, n_stacks)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         flat_x = x.view(x.size(0), -1)
         residuals = flat_x.clone()
         total_forecast = torch.zeros(x.size(0), self.forecast_horizon).to(x.device)
 
-        # Gating logic
+        som_features = None
         if self.use_som_gating:
             close_price_sequence = x[:, :, 0]
             som_features = self.som_feature_extractor.extract_features(close_price_sequence)
@@ -136,4 +136,4 @@ class NBEATSWithSOM(nn.Module):
             else:
                 total_forecast += stack_forecast
 
-        return total_forecast
+        return total_forecast, som_features
