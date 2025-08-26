@@ -4,13 +4,16 @@ import numpy as np
 import pandas as pd
 
 class TimeSeriesDataLoader:
-    def __init__(self, df: pd.DataFrame, sequence_length: int, forecast_horizon: int, train_split: float = 0.8, batch_size: int = 32, feature_cols=['Close']):
+    def __init__(self, df: pd.DataFrame, sequence_length: int, forecast_horizon: int, train_split: float = 0.8, batch_size: int = 32, feature_cols=['Close'], target_col=None):
         self.df = df
         self.sequence_length = sequence_length
         self.forecast_horizon = forecast_horizon
         self.train_split = train_split
         self.batch_size = batch_size
         self.feature_cols = feature_cols
+
+        # If target_col is not specified, default to the first feature column
+        self.target_col = target_col if target_col is not None else feature_cols[0]
 
         self._process_data()
 
@@ -21,25 +24,27 @@ class TimeSeriesDataLoader:
         # Create sequences
         X, y = self._create_sequences(data)
 
-        # Squeeze the last dimension if only one feature is used
-        if len(self.feature_cols) == 1:
-            X = X.squeeze(-1)
-
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
 
     def _create_sequences(self, data):
         X, y = [], []
+
+        try:
+            target_col_index = self.feature_cols.index(self.target_col)
+        except ValueError:
+            raise ValueError(f"Target column '{self.target_col}' not found in feature columns: {self.feature_cols}")
+
         num_sequences = len(data) - self.sequence_length - self.forecast_horizon + 1
         for i in range(num_sequences):
             seq_end = i + self.sequence_length
             forecast_end = seq_end + self.forecast_horizon
 
-            # Use all feature columns for the input sequence
-            X.append(data[i:seq_end])
+            # Input sequence uses all specified feature columns
+            X.append(data[i:seq_end, :])
 
-            # Use the first feature column (assumed to be 'Close') for the target
-            y.append(data[seq_end:forecast_end, 0])
+            # Target sequence uses only the specified target column
+            y.append(data[seq_end:forecast_end, target_col_index])
 
         return np.array(X), np.array(y)
 

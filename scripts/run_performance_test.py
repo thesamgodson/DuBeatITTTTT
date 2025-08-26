@@ -32,17 +32,28 @@ def main():
 
     # --- Data Scaling ---
     print("Scaling data...")
-    scaler = StandardScaler()
+    feature_cols = ['Close', 'Volume']
+    target_col = 'Close'
 
-    # Fit on the training data portion
+    # Scaler for input features
+    feature_scaler = StandardScaler()
+
+    # Scaler for the target variable
+    target_scaler = StandardScaler()
+
     train_size = int(0.8 * len(btc_df))
-    # Reshape data for scaler
-    close_prices = btc_df['Close'].values.reshape(-1, 1)
 
-    scaler.fit(close_prices[:train_size])
+    # Fit scalers on the training data portion
+    feature_scaler.fit(btc_df[feature_cols][:train_size])
+    target_scaler.fit(btc_df[[target_col]][:train_size])
 
-    # Transform the entire column
-    btc_df['Close_scaled'] = scaler.transform(close_prices).flatten()
+    # Transform the data
+    scaled_features = feature_scaler.transform(btc_df[feature_cols])
+
+    # Create new columns for scaled data
+    scaled_feature_cols = [f"{col}_scaled" for col in feature_cols]
+    for i, col_name in enumerate(scaled_feature_cols):
+        btc_df[col_name] = scaled_features[:, i]
 
     # Use the scaled data for the model
     data_loader = TimeSeriesDataLoader(
@@ -51,16 +62,18 @@ def main():
         forecast_horizon=5,
         train_split=0.8,
         batch_size=64,
-        feature_cols=['Close_scaled'] # Use the scaled column
+        feature_cols=scaled_feature_cols,
+        target_col='Close_scaled' # The target is the scaled close price
     )
     train_loader, test_loader = data_loader.get_loaders()
 
-    # 2. Train SOM
+    # 2. Train SOM on the 'Close' price sequences
     print("Training SOM...")
-    # Training SOM on scaled data
-    som_training_data = data_loader.X.numpy()
+    # We need the un-sequenced close prices for SOM training patterns
+    # The shape of X is (num_samples, sequence_length, num_features)
+    close_price_sequences = data_loader.X[:, :, scaled_feature_cols.index('Close_scaled')].numpy()
     som = SimpleSOM(input_len=30, grid_size=(10, 10), learning_rate=0.5, sigma=1.0)
-    som.train(som_training_data, num_iteration=1000)
+    som.train(close_price_sequences, num_iteration=1000)
 
     # 3. Initialize Model
     print("Initializing NBEATSWithSOM model...")
@@ -72,7 +85,8 @@ def main():
         n_stacks=2,
         n_blocks=3,
         n_layers=4,
-        layer_width=256
+        layer_width=256,
+        num_features=len(scaled_feature_cols)
     )
 
     # 4. Train the NBEATS Model
@@ -116,9 +130,9 @@ def main():
     y_true_scaled_np = np.concatenate(all_y_true_scaled)
     y_pred_scaled_np = np.concatenate(all_y_pred_scaled)
 
-    # --- Inverse Transform Predictions ---
-    y_true_np = scaler.inverse_transform(y_true_scaled_np)
-    y_pred_np = scaler.inverse_transform(y_pred_scaled_np)
+    # --- Inverse Transform Predictions using the target_scaler ---
+    y_true_np = target_scaler.inverse_transform(y_true_scaled_np)
+    y_pred_np = target_scaler.inverse_transform(y_pred_scaled_np)
 
     # Calculate Metrics on original scale
     rmse = np.sqrt(np.mean((y_true_np - y_pred_np)**2))
