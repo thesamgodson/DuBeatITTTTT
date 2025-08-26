@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import pandas as pd
 
 from .dynamic_som import DynamicSOM
 from .novelty_detector import RegimeNoveltyDetector
@@ -10,7 +11,7 @@ class DriftNet(nn.Module):
     DriftNet v0.1: A model that combines a dynamic SOM for regime detection
     with an ensemble of simple expert models for forecasting.
     """
-    def __init__(self, input_dim: int, forecast_horizon: int, initial_experts: int = 4):
+    def __init__(self, input_dim: int, forecast_horizon: int, initial_experts: int = 4, novelty_threshold: float = 1.5):
         """
         Initializes the DriftNet model.
 
@@ -18,6 +19,7 @@ class DriftNet(nn.Module):
             input_dim (int): The dimensionality of the input sequences.
             forecast_horizon (int): The number of time steps to forecast.
             initial_experts (int): The number of initial experts/SOM nodes.
+            novelty_threshold (float): The threshold for the novelty detector.
         """
         super().__init__()
         self.input_dim = input_dim
@@ -25,7 +27,7 @@ class DriftNet(nn.Module):
 
         # 1. Core Components
         self.dynamic_som = DynamicSOM(input_dim=input_dim, initial_nodes=initial_experts)
-        self.novelty_detector = RegimeNoveltyDetector(input_dim=input_dim, latent_dim=10)
+        self.novelty_detector = RegimeNoveltyDetector(input_dim=input_dim, latent_dim=10, threshold=novelty_threshold)
 
         # 2. Expert Ensemble
         # Each expert is a simple linear model for this version.
@@ -33,36 +35,45 @@ class DriftNet(nn.Module):
             nn.Linear(input_dim, forecast_horizon) for _ in range(initial_experts)
         ])
 
-    def _spawn_new_expert(self, bmu_idx: int):
+        # For Experiment 1: Logging expert births
+        self.birth_log = []
+
+    def _spawn_new_expert(self, bmu_idx: int, timestamp: pd.Timestamp, trigger_input: np.array):
         """
-        Adds a new expert to the ensemble, linked to a new SOM node.
+        Adds a new expert to the ensemble and logs the birth event.
 
         Args:
             bmu_idx (int): The index of the BMU that triggered the novelty event.
+            timestamp (pd.Timestamp): The timestamp of the data that triggered the birth.
+            trigger_input (np.array): The input sequence that was flagged as novel.
         """
-        # Add a new node to the SOM near the BMU
         new_node_idx = self.dynamic_som.add_node(bmu_idx)
 
-        # Create a new expert and add it to the list
-        # Ensure the new expert is on the same device as the rest of the model
         device = next(self.parameters()).device
         new_expert = nn.Linear(self.input_dim, self.forecast_horizon).to(device)
         self.experts.append(new_expert)
 
-        # Ensure the number of experts matches the number of SOM nodes
+        # Log the event
+        self.birth_log.append({
+            "timestamp": timestamp,
+            "new_expert_id": new_node_idx,
+            "spawned_from_expert_id": bmu_idx,
+            "trigger_input_sample": trigger_input
+        })
+
         assert len(self.experts) == self.dynamic_som.num_nodes, "Expert count mismatch!"
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, timestamp: pd.Timestamp = None) -> torch.Tensor:
         """
         The forward pass for a single time step's input sequence.
 
         Args:
             x (torch.Tensor): A single input sequence, shape (1, input_dim).
+            timestamp (pd.Timestamp): The timestamp of the current input, for logging.
 
         Returns:
             torch.Tensor: The forecast from the selected expert.
         """
-        # Ensure input is flattened
         if x.dim() > 2:
             x = x.view(x.size(0), -1)
 
@@ -70,9 +81,8 @@ class DriftNet(nn.Module):
 
         # 1. Check for novelty
         if self.novelty_detector.check_novelty(x):
-            # Find the BMU to spawn a new expert near
             bmu_to_spawn_from = self.dynamic_som.find_bmu(x_numpy)
-            self._spawn_new_expert(bmu_to_spawn_from)
+            self._spawn_new_expert(bmu_to_spawn_from, timestamp, x_numpy)
 
         # 2. Find the current regime (BMU)
         bmu_idx = self.dynamic_som.find_bmu(x_numpy)

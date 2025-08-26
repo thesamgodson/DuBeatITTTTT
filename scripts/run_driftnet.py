@@ -61,6 +61,14 @@ def main():
 
     all_results = []
     expert_counts = []
+    feature_importance_log = []
+
+    # We initialize the model once, and it evolves over the windows.
+    # This is a more realistic simulation of a live model.
+    initial_train_df = full_df.loc[start_date : start_date + train_window]
+    X_initial, _ = create_sequences(initial_train_df[feature_cols].values, 30, 5)
+    input_dim = X_initial.shape[1] * X_initial.shape[2]
+    model = DriftNet(input_dim=input_dim, forecast_horizon=5, novelty_threshold=1.1)
 
     while current_date + train_window + test_window <= end_date:
         train_start = current_date
@@ -81,63 +89,80 @@ def main():
             current_date += test_window
             continue
 
-        # --- Initialize and Train Model ---
-        print("Initializing and training DriftNet for this window...")
-        input_dim = X_train.shape[1] * X_train.shape[2] # seq_len * num_features
+        # --- Train Model on Current Window ---
+        print(f"Training DriftNet on data from {train_start.date()} to {train_end.date()}...")
 
-        model = DriftNet(input_dim=input_dim, forecast_horizon=5)
-
-        # Pre-train novelty detector
+        # Pre-train novelty detector on the new training data
         train_tensor_dataset = torch.utils.data.TensorDataset(torch.from_numpy(X_train).float())
         train_loader = torch.utils.data.DataLoader(train_tensor_dataset, batch_size=32)
         model.train_novelty_detector(train_loader, epochs=5)
 
-        # Main training loop
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.MSELoss()
 
-        for epoch in range(10): # Simplified training for now
+        for epoch in range(10):
             for i in range(len(X_train)):
                 x_i = torch.from_numpy(X_train[i]).float().view(1, -1)
                 y_i = torch.from_numpy(y_train[i]).float().view(1, -1)
-
-                # Update SOM and get BMU for training the experts
                 bmu_idx = model.get_bmu_and_update_som(x_i, epoch, 10)
-
-                # Train the expert associated with the BMU
                 optimizer.zero_grad()
-                # We need to get the prediction from the specific expert to train it
                 y_pred = model.experts[bmu_idx](x_i)
                 loss = criterion(y_pred, y_i)
                 loss.backward()
                 optimizer.step()
 
         # --- Evaluation on Test Set (with novelty detection) ---
-        print("Evaluating on test set...")
+        print(f"Evaluating on test set from {train_end.date()} to {test_end.date()}...")
         model.eval()
         predictions = []
         with torch.no_grad():
             for i in range(len(X_test)):
                 x_i = torch.from_numpy(X_test[i]).float().view(1, -1)
-                # The forward pass now handles novelty detection and expert spawning
-                y_pred = model(x_i)
+                current_sample_date = test_df.index[i + 30 - 1]
+                y_pred = model(x_i, current_sample_date)
                 predictions.append(y_pred.numpy())
 
-        # Store results (simplified for now)
         mse = np.mean((np.array(predictions).flatten() - y_test.flatten())**2)
         print(f"Test MSE for this window: {mse:.4f}")
         all_results.append(mse)
         expert_counts.append(model.dynamic_som.num_nodes)
 
-        # Move to the next window
+        # --- Log Feature Importance for this window ---
+        num_features = len(feature_cols)
+        seq_len = 30
+        for expert_id, expert in enumerate(model.experts):
+            weights = expert.weight.detach().cpu().numpy()
+            weights_reshaped = weights.reshape(-1, seq_len, num_features)
+            for i, feature_name in enumerate(feature_cols):
+                feature_importance = np.mean(np.abs(weights_reshaped[:, :, i]))
+                feature_importance_log.append({
+                    "window_end_date": train_end.date(),
+                    "expert_id": expert_id,
+                    "feature": feature_name,
+                    "importance": feature_importance
+                })
+
         current_date += test_window
 
+    # --- Final Report and Saving Artifacts ---
     print("\n\n" + "="*60)
     print("           DRIFTNET ROLLING EVALUATION REPORT")
     print("="*60)
     print(f"Average Test MSE across all windows: {np.mean(all_results):.4f}")
     print(f"Expert counts per window: {expert_counts}")
-    print(f"Final number of experts: {expert_counts[-1]}")
+    if expert_counts:
+        print(f"Final number of experts: {expert_counts[-1]}")
+
+    # Save the logs
+    os.makedirs('results', exist_ok=True)
+    if model.birth_log:
+        birth_log_df = pd.DataFrame(model.birth_log)
+        birth_log_df.to_csv('results/expert_birth_log.csv', index=False)
+        print("\nExpert birth log saved to 'results/expert_birth_log.csv'")
+    if feature_importance_log:
+        importance_df = pd.DataFrame(feature_importance_log)
+        importance_df.to_csv('results/expert_feature_importance.csv', index=False)
+        print("Feature importance log saved to 'results/expert_feature_importance.csv'")
 
 if __name__ == "__main__":
     main()
