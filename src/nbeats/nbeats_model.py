@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import Tuple, Optional
 
 class NBEATSBlock(nn.Module):
     def __init__(self, input_size: int, theta_size: int, basis_function: nn.Module, layers: int, layer_size: int):
@@ -21,23 +21,19 @@ class NBEATSBlock(nn.Module):
 class TrendBasis(nn.Module):
     def __init__(self, backcast_size, forecast_size, theta_size):
         super().__init__()
-        # theta_size is the degree of the polynomial + 1
         self.p = theta_size
         self.backcast_size = backcast_size
         self.forecast_size = forecast_size
 
     def forward(self, theta):
-        # theta is of shape (batch, p)
         powers = torch.arange(self.p, device=theta.device, dtype=torch.float32)
 
-        # Backcast
         t_back = torch.arange(self.backcast_size, device=theta.device, dtype=torch.float32)
-        backcast_basis = t_back.unsqueeze(0).pow(powers.unsqueeze(1)) # shape (p, backcast_size)
+        backcast_basis = t_back.unsqueeze(0).pow(powers.unsqueeze(1))
         backcast = torch.einsum('bp,pt->bt', theta, backcast_basis)
 
-        # Forecast
         t_fore = torch.arange(self.forecast_size, device=theta.device, dtype=torch.float32)
-        forecast_basis = t_fore.unsqueeze(0).pow(powers.unsqueeze(1)) # shape (p, forecast_size)
+        forecast_basis = t_fore.unsqueeze(0).pow(powers.unsqueeze(1))
         forecast = torch.einsum('bp,pt->bt', theta, forecast_basis)
 
         return backcast, forecast
@@ -45,14 +41,9 @@ class TrendBasis(nn.Module):
 class SeasonalityBasis(nn.Module):
     def __init__(self, backcast_size, forecast_size, theta_size):
         super().__init__()
-        self.backcast_size = backcast_size
-        self.forecast_size = forecast_size
-        # theta_size is the number of harmonics * 2 (for cos and sin)
         self.num_harmonics = theta_size // 2
-
         frequencies = torch.arange(1, self.num_harmonics + 1, dtype=torch.float32) * torch.pi
 
-        # Time vectors
         t_back = torch.arange(backcast_size, dtype=torch.float32)
         self.backcast_cos = torch.cos(frequencies.unsqueeze(1) * t_back.unsqueeze(0))
         self.backcast_sin = torch.sin(frequencies.unsqueeze(1) * t_back.unsqueeze(0))
@@ -63,7 +54,6 @@ class SeasonalityBasis(nn.Module):
 
     def forward(self, theta):
         device = theta.device
-
         theta_cos = theta[:, :self.num_harmonics]
         theta_sin = theta[:, self.num_harmonics:]
 
@@ -76,22 +66,28 @@ class SeasonalityBasis(nn.Module):
         return backcast, forecast
 
 class NBEATSWithSOM(nn.Module):
-    def __init__(self, som_feature_extractor, sequence_length, forecast_horizon, n_stacks, n_blocks, n_layers, layer_width, num_features=1):
+    def __init__(self,
+                 sequence_length: int,
+                 forecast_horizon: int,
+                 n_stacks: int,
+                 n_blocks: int,
+                 n_layers: int,
+                 layer_width: int,
+                 num_features: int = 1,
+                 som_feature_extractor: Optional[nn.Module] = None,
+                 use_som_gating: bool = True):
         super().__init__()
 
+        self.use_som_gating = use_som_gating and (som_feature_extractor is not None)
         self.som_feature_extractor = som_feature_extractor
-        self.num_features = num_features
-        self.sequence_length = sequence_length
         self.forecast_horizon = forecast_horizon
 
         nbeats_input_size = sequence_length * num_features
-
-        # Theta sizes are now per-basis, not combined
-        trend_theta_size = 4  # polynomial degree 3
-        seasonality_theta_size = 20 # 10 harmonics
+        trend_theta_size = 4
+        seasonality_theta_size = 20
 
         if n_stacks != 2:
-            print("Warning: NBEATSWithSOM is designed for 2 stacks (trend, seasonality). Overriding n_stacks to 2.")
+            print("Warning: NBEATS model is designed for 2 stacks (trend, seasonality). Overriding n_stacks to 2.")
             n_stacks = 2
 
         self.stacks = nn.ModuleList()
@@ -112,25 +108,21 @@ class NBEATSWithSOM(nn.Module):
             seasonality_blocks.append(block)
         self.stacks.append(seasonality_blocks)
 
-        # Gating mechanism based on SOM features
-        dummy_som_input = torch.randn(1, sequence_length)
-        som_feature_size = self.som_feature_extractor.extract_features(dummy_som_input).shape[1]
-        self.gate_layer = nn.Linear(som_feature_size, n_stacks)
+        if self.use_som_gating:
+            dummy_som_input = torch.randn(1, sequence_length)
+            som_feature_size = self.som_feature_extractor.extract_features(dummy_som_input).shape[1]
+            self.gate_layer = nn.Linear(som_feature_size, n_stacks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x has shape (batch_size, sequence_length, num_features)
-
-        # Extract SOM features from the 'Close' price sequence
-        close_price_sequence = x[:, :, 0]
-        som_features = self.som_feature_extractor.extract_features(close_price_sequence)
-
-        gate_weights = torch.softmax(self.gate_layer(som_features), dim=1)
-
-        # Flatten the input for the NBEATS blocks
         flat_x = x.view(x.size(0), -1)
-
         residuals = flat_x.clone()
         total_forecast = torch.zeros(x.size(0), self.forecast_horizon).to(x.device)
+
+        # Gating logic
+        if self.use_som_gating:
+            close_price_sequence = x[:, :, 0]
+            som_features = self.som_feature_extractor.extract_features(close_price_sequence)
+            gate_weights = torch.softmax(self.gate_layer(som_features), dim=1)
 
         for i, stack in enumerate(self.stacks):
             stack_forecast = torch.zeros(x.size(0), self.forecast_horizon).to(x.device)
@@ -139,6 +131,9 @@ class NBEATSWithSOM(nn.Module):
                 residuals = residuals - backcast
                 stack_forecast = stack_forecast + block_forecast
 
-            total_forecast += stack_forecast * gate_weights[:, i].unsqueeze(1)
+            if self.use_som_gating:
+                total_forecast += stack_forecast * gate_weights[:, i].unsqueeze(1)
+            else:
+                total_forecast += stack_forecast
 
         return total_forecast

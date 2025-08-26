@@ -53,18 +53,22 @@ def run_model_evaluation(model_config: dict, btc_df: pd.DataFrame, evaluator: Fi
     )
     train_loader, test_loader = data_loader.get_loaders()
 
-    # --- 2. SOM Training ---
-    print("Training SOM...")
-    close_price_idx = scaled_feature_cols.index('Close_scaled')
-    som_training_data = data_loader.X[:, :, close_price_idx].numpy()
-    som = SimpleSOM(input_len=model_config['sequence_length'], grid_size=(10, 10))
-    som.train(som_training_data, num_iteration=1000)
+    # --- 2. Model Initialization ---
+    use_som = model_config.get('use_som_gating', False)
+    feature_extractor = None
 
-    # --- 3. Model Initialization ---
-    print("Initializing NBEATSWithSOM model...")
-    feature_extractor = SOMFeatureExtractor(som)
+    if use_som:
+        print("Training SOM...")
+        close_price_idx = scaled_feature_cols.index('Close_scaled')
+        som_training_data = data_loader.X[:, :, close_price_idx].numpy()
+        som = SimpleSOM(input_len=model_config['sequence_length'], grid_size=(10, 10))
+        som.train(som_training_data, num_iteration=1000)
+        feature_extractor = SOMFeatureExtractor(som)
+
+    print("Initializing NBEATS model...")
     model = NBEATSWithSOM(
         som_feature_extractor=feature_extractor,
+        use_som_gating=use_som,
         sequence_length=model_config['sequence_length'],
         forecast_horizon=model_config['forecast_horizon'],
         n_stacks=2,
@@ -74,7 +78,7 @@ def run_model_evaluation(model_config: dict, btc_df: pd.DataFrame, evaluator: Fi
         num_features=len(feature_cols)
     )
 
-    # --- 4. Model Training ---
+    # --- 3. Model Training ---
     print("Training NBEATS model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -93,7 +97,7 @@ def run_model_evaluation(model_config: dict, btc_df: pd.DataFrame, evaluator: Fi
         if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{model_config['epochs']}, Loss: {loss.item():.4f}")
 
-    # --- 5. Evaluation ---
+    # --- 4. Evaluation ---
     print("Evaluating model...")
     model.eval()
     all_y_pred_scaled = []
@@ -109,20 +113,21 @@ def run_model_evaluation(model_config: dict, btc_df: pd.DataFrame, evaluator: Fi
     y_pred_scaled = np.concatenate(all_y_pred_scaled)
     y_true_scaled = np.concatenate(all_y_true_scaled)
 
-    # Inverse transform to get actual price predictions
     y_pred_prices = target_scaler.inverse_transform(y_pred_scaled)
-    y_true_prices = target_scaler.inverse_transform(y_true_scaled)
 
-    # The evaluator needs returns, not prices.
-    # We need the actual returns of the test set.
-    test_set_size = len(y_true_prices)
-    actual_returns = btc_df[target_col].pct_change().dropna().values[-test_set_size:]
+    test_set_size = len(y_true_scaled)
+    test_start_index = len(btc_df) - test_set_size
 
-    # For predictions, we need to convert price predictions to return predictions.
-    # This is tricky because we predict a sequence. Let's use the first step forecast.
-    predicted_returns = (y_pred_prices[:, 0] / btc_df[target_col].values[-test_set_size-1:-1]) - 1
+    # Get the actual returns for the test period
+    actual_returns = btc_df['Close'].pct_change().iloc[test_start_index:].values
 
-    # Ensure lengths match
+    # To calculate predicted returns, we need the price from the previous day for each prediction
+    prev_prices = btc_df['Close'].iloc[test_start_index-1:-1].values
+
+    # We use the first step of the forecast horizon for our prediction
+    predicted_returns = (y_pred_prices[:, 0] / prev_prices) - 1
+
+    # Ensure lengths match for safety, though they should be correct
     min_len = min(len(predicted_returns), len(actual_returns))
 
     metrics = evaluator.calculate_all_metrics(
@@ -134,11 +139,19 @@ def run_model_evaluation(model_config: dict, btc_df: pd.DataFrame, evaluator: Fi
     return metrics
 
 def main():
-    # Define model configurations to test
     model_configs = [
+        {
+            "name": "Pure N-BEATS (Close Only)",
+            "feature_cols": ['Close'],
+            "use_som_gating": False,
+            "sequence_length": 30,
+            "forecast_horizon": 5,
+            "epochs": 30
+        },
         {
             "name": "NBEATS-SOM (Close Only)",
             "feature_cols": ['Close'],
+            "use_som_gating": True,
             "sequence_length": 30,
             "forecast_horizon": 5,
             "epochs": 30
@@ -146,20 +159,19 @@ def main():
         {
             "name": "NBEATS-SOM (Close + Volume)",
             "feature_cols": ['Close', 'Volume'],
+            "use_som_gating": True,
             "sequence_length": 30,
             "forecast_horizon": 5,
             "epochs": 30
         }
     ]
 
-    # Load data once
     print("Loading and preparing base data...")
     btc_df = load_bitcoin_data(start_date='2020-01-01', end_date='2024-12-31')
     if btc_df.empty:
         print("Failed to load data. Exiting.")
         return
 
-    # Initialize evaluator
     evaluator = FinancialMetricsEvaluator()
 
     results = {}
@@ -167,7 +179,6 @@ def main():
         metrics = run_model_evaluation(config, btc_df.copy(), evaluator)
         results[config['name']] = metrics
 
-    # --- Print Final Report ---
     print("\n\n" + "="*60)
     print("           MASTER MODEL EVALUATION REPORT")
     print("="*60)
@@ -175,8 +186,6 @@ def main():
     for model_name, metrics in results.items():
         print(f"\n--- Results for: {model_name} ---")
         evaluator.print_evaluation_report(metrics)
-
-    # Here you could also format the results for the README
 
 if __name__ == "__main__":
     main()
