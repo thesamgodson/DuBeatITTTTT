@@ -16,9 +16,10 @@ def load_bitcoin_data(start_date='2014-01-01', end_date='2024-12-31'):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
 
-        df.reset_index(inplace=True)
+        # The index should be the date from yfinance
+        df.index.name = 'Date'
 
-        required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
 
         for col in required_columns:
             if col not in df.columns:

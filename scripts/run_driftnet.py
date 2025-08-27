@@ -68,7 +68,8 @@ def main():
     initial_train_df = full_df.loc[start_date : start_date + train_window]
     X_initial, _ = create_sequences(initial_train_df[feature_cols].values, 30, 5)
     input_dim = X_initial.shape[1] * X_initial.shape[2]
-    model = DriftNet(input_dim=input_dim, forecast_horizon=5, novelty_threshold=1.1)
+    # Using a more sensitive threshold to encourage node birth
+    model = DriftNet(input_dim=input_dim, forecast_horizon=5, novelty_threshold=1.2)
 
     while current_date + train_window + test_window <= end_date:
         train_start = current_date
