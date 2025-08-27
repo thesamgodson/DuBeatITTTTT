@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from src.data_processing.data_loader import load_bitcoin_data
 from src.data_processing.macro_loader import get_google_trends_data
 from src.driftnet.model import DriftNet
-# from src.evaluation import FinancialMetricsEvaluator # Will be used later
+from src.evaluation import FinancialMetricsEvaluator
 
 def create_sequences(data, sequence_length, forecast_horizon):
     """Creates sequences from the input data."""
@@ -68,8 +68,9 @@ def main():
     initial_train_df = full_df.loc[start_date : start_date + train_window]
     X_initial, _ = create_sequences(initial_train_df[feature_cols].values, 30, 5)
     input_dim = X_initial.shape[1] * X_initial.shape[2]
-    # Using a more sensitive threshold to encourage node birth
-    model = DriftNet(input_dim=input_dim, forecast_horizon=5, novelty_threshold=1.2)
+    # Using a calibrated threshold.
+    model = DriftNet(input_dim=input_dim, forecast_horizon=5, novelty_threshold=2.0)
+    evaluator = FinancialMetricsEvaluator()
 
     while current_date + train_window + test_window <= end_date:
         train_start = current_date
@@ -123,9 +124,30 @@ def main():
                 y_pred = model(x_i, current_sample_date)
                 predictions.append(y_pred.numpy())
 
-        mse = np.mean((np.array(predictions).flatten() - y_test.flatten())**2)
-        print(f"Test MSE for this window: {mse:.4f}")
-        all_results.append(mse)
+        # --- Financial Evaluation for this window ---
+        # 1. Get the last known price from each sequence in the test set
+        last_prices_scaled = X_test[:, -1, 0] # Last day, 'Close' feature
+
+        # 2. The model predicts the price for the NEXT step. We take the first step.
+        y_pred_scaled = np.array(predictions)[:, 0, 0]
+
+        # 3. Generate directional signals (1 for up, 0 for down)
+        signals = (y_pred_scaled > last_prices_scaled).astype(int)
+
+        # 4. Get the *actual* returns from the unscaled dataframe for the test period
+        # The first return corresponds to the first prediction
+        actual_returns_unscaled = full_df['Close'].pct_change().loc[test_df.index].values[30:]
+
+        # 5. Ensure lengths match
+        min_len = min(len(signals), len(actual_returns_unscaled))
+
+        metrics = evaluator.calculate_all_metrics(
+            predictions=signals[:min_len],
+            actual_returns=actual_returns_unscaled[:min_len]
+        )
+        sharpe = metrics.get('sharpe_ratio', 0)
+        print(f"Test Sharpe Ratio for this window: {sharpe:.4f}")
+        all_results.append(sharpe)
         expert_counts.append(model.dynamic_som.num_nodes)
 
         # --- Log Feature Importance for this window ---
@@ -149,7 +171,7 @@ def main():
     print("\n\n" + "="*60)
     print("           DRIFTNET ROLLING EVALUATION REPORT")
     print("="*60)
-    print(f"Average Test MSE across all windows: {np.mean(all_results):.4f}")
+    print(f"Average Test Sharpe Ratio across all windows: {np.mean(all_results):.4f}")
     print(f"Expert counts per window: {expert_counts}")
     if expert_counts:
         print(f"Final number of experts: {expert_counts[-1]}")
