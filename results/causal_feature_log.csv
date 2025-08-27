@@ -1,0 +1,27 @@
+window_end,selected_features
+2020-07-01,['Close']
+2020-09-01,"['Close', 'Volume', 'bitcoin']"
+2020-11-01,"['Close', 'bitcoin']"
+2021-01-01,"['Close', 'Volume', 'bitcoin']"
+2021-03-01,"['Close', 'Volume', 'bitcoin']"
+2021-05-01,"['Close', 'Volume', 'bitcoin']"
+2021-07-01,['Close']
+2021-09-01,"['Close', 'Volume', 'bitcoin']"
+2021-11-01,"['Close', 'Volume', 'bitcoin']"
+2022-01-01,"['Close', 'Volume']"
+2022-03-01,"['Close', 'Volume', 'bitcoin']"
+2022-05-01,"['Close', 'Volume', 'bitcoin']"
+2022-07-01,"['Close', 'Volume', 'bitcoin']"
+2022-09-01,"['Close', 'Volume', 'bitcoin']"
+2022-11-01,"['Close', 'Volume', 'bitcoin']"
+2023-01-01,"['Close', 'bitcoin']"
+2023-03-01,['Close']
+2023-05-01,"['Close', 'bitcoin']"
+2023-07-01,"['Close', 'Volume', 'bitcoin']"
+2023-09-01,"['Close', 'Volume', 'bitcoin']"
+2023-11-01,"['Close', 'Volume', 'bitcoin']"
+2024-01-01,"['Close', 'Volume', 'bitcoin']"
+2024-03-01,"['Close', 'bitcoin']"
+2024-05-01,"['Close', 'Volume', 'bitcoin']"
+2024-07-01,"['Close', 'Volume', 'bitcoin']"
+2024-09-01,['Close']

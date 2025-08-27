@@ -1,80 +1,71 @@
-import torch
-import torch.nn as nn
 import numpy as np
-from .autoencoder import AutoEncoder
+import pandas as pd
+from statsmodels.tsa.stattools import acf
 
-class RegimeNoveltyDetector:
+class ForecastDivergenceDetector:
     """
-    Detects novel market regimes based on the reconstruction error of an autoencoder.
+    Detects regime shifts by monitoring for persistent, structured forecast errors.
+    This is the "meta-cognitive monitor" of the DriftNet architecture.
     """
-    def __init__(self, input_dim: int, latent_dim: int, threshold: float = 1.5, window_size: int = 100):
+    def __init__(self, error_window_size: int = 30, threshold_quantile: float = 0.95):
         """
-        Initializes the novelty detector.
+        Initializes the detector.
 
         Args:
-            input_dim (int): The input dimension for the autoencoder.
-            latent_dim (int): The latent dimension for the autoencoder.
-            threshold (float): The factor by which the current error must exceed the
-                               running average to be considered novel (e.g., 1.5 = 50% higher).
-            window_size (int): The number of recent samples to use for the running average.
+            error_window_size (int): The rolling window size for calculating error stats.
+            threshold_quantile (float): The quantile to use for the adaptive threshold
+                                        (e.g., 0.95 means the error must be in the top 5%).
         """
-        self.autoencoder = AutoEncoder(input_dim, latent_dim)
-        self.optimizer = torch.optim.Adam(self.autoencoder.parameters(), lr=0.001)
-        self.criterion = torch.nn.MSELoss()
-
-        self.threshold = threshold
-        self.window_size = window_size
+        self.error_window_size = error_window_size
+        self.threshold_quantile = threshold_quantile
         self.error_history = []
-        self.running_avg_error = 0.0
 
-    def train_autoencoder(self, data_loader: torch.utils.data.DataLoader, epochs: int = 5):
+    def _get_adaptive_threshold(self) -> float:
+        """Calculates the current novelty threshold based on error history."""
+        if len(self.error_history) < self.error_window_size:
+            return np.inf # Not enough data to set a threshold
+
+        return np.quantile(self.error_history, self.threshold_quantile)
+
+    def check_novelty(self, forecast_error: float) -> bool:
         """
-        Trains the internal autoencoder on a dataset.
+        Checks if the current state constitutes a novelty event (a forecast crisis).
+
+        A crisis is defined by:
+        1. A forecast error that is unusually high compared to recent history.
+        2. The recent forecast errors are autocorrelated, meaning the error is
+           systematic, not random noise.
 
         Args:
-            data_loader: A PyTorch DataLoader providing the training data.
-            epochs (int): The number of epochs to train for.
-        """
-        print("Training novelty detector's autoencoder...")
-        self.autoencoder.train()
-        for epoch in range(epochs):
-            for data_batch in data_loader:
-                # Assuming data_loader yields batches of sequences
-                x = data_batch[0] if isinstance(data_batch, list) else data_batch
-                x = x.view(x.size(0), -1) # Flatten the sequence
-
-                self.optimizer.zero_grad()
-                reconstructed = self.autoencoder(x)
-                loss = self.criterion(reconstructed, x)
-                loss.backward()
-                self.optimizer.step()
-        print("Autoencoder training complete.")
-
-    def check_novelty(self, x: torch.Tensor) -> bool:
-        """
-        Checks if the input sample `x` represents a novelty.
-
-        Args:
-            x (torch.Tensor): The input sample tensor (a single sequence).
+            forecast_error (float): The forecast error (e.g., MSE) for the current step.
 
         Returns:
-            bool: True if the sample is considered novel, False otherwise.
+            bool: True if a novelty event is detected.
         """
-        x = x.view(1, -1) # Ensure it's a batch of 1
-        current_error = self.autoencoder.get_reconstruction_error(x).item()
-
         is_novel = False
-        # Only start detecting after the initial window is filled
-        if len(self.error_history) > self.window_size:
-            if current_error > self.running_avg_error * self.threshold:
-                is_novel = True
 
-        # Update the running average
-        self.error_history.append(current_error)
-        if len(self.error_history) > self.window_size:
+        # 1. Check if the error exceeds the adaptive threshold
+        adaptive_threshold = self._get_adaptive_threshold()
+        if forecast_error > adaptive_threshold:
+
+            # 2. Check for autocorrelation in recent errors
+            # We need at least a few errors to compute ACF
+            if len(self.error_history) > 10:
+                # The [1] gets the first lag's autocorrelation
+                try:
+                    residual_autocorr = acf(self.error_history, nlags=1, fft=False)[1]
+
+                    if residual_autocorr > 0.5:
+                        print(f"Novelty detected! Error {forecast_error:.4f} > Threshold {adaptive_threshold:.4f} AND ACF {residual_autocorr:.2f} > 0.5")
+                        is_novel = True
+                except Exception as e:
+                    # acf can sometimes fail with certain patterns of data
+                    print(f"Could not compute ACF: {e}")
+                    pass
+
+        # Update error history
+        self.error_history.append(forecast_error)
+        if len(self.error_history) > self.error_window_size:
             self.error_history.pop(0)
-
-        if len(self.error_history) > 0:
-            self.running_avg_error = np.mean(self.error_history)
 
         return is_novel

@@ -4,102 +4,67 @@ import numpy as np
 import pandas as pd
 
 from .dynamic_som import DynamicSOM
-from .novelty_detector import RegimeNoveltyDetector
+from .novelty_detector import ForecastDivergenceDetector
+from sklearn.cluster import DBSCAN
 
 class DriftNet(nn.Module):
     """
-    DriftNet v0.1: A model that combines a dynamic SOM for regime detection
-    with an ensemble of simple expert models for forecasting.
+    DriftNet v0.2: A model that uses a Forecast Divergence Detector (FDD)
+    to trigger the growth of a dynamic SOM and its expert ensemble.
     """
-    def __init__(self, input_dim: int, forecast_horizon: int, initial_experts: int = 4, novelty_threshold: float = 1.5):
+    def __init__(self, input_dim: int, forecast_horizon: int, initial_experts: int = 4):
         """
         Initializes the DriftNet model.
-
-        Args:
-            input_dim (int): The dimensionality of the input sequences.
-            forecast_horizon (int): The number of time steps to forecast.
-            initial_experts (int): The number of initial experts/SOM nodes.
-            novelty_threshold (float): The threshold for the novelty detector.
         """
         super().__init__()
         self.input_dim = input_dim
         self.forecast_horizon = forecast_horizon
 
-        # 1. Core Components
         self.dynamic_som = DynamicSOM(input_dim=input_dim, initial_nodes=initial_experts)
-        self.novelty_detector = RegimeNoveltyDetector(input_dim=input_dim, latent_dim=10, threshold=novelty_threshold)
+        self.fdd = ForecastDivergenceDetector()
 
-        # 2. Expert Ensemble
-        # Each expert is a simple linear model for this version.
         self.experts = nn.ModuleList([
             nn.Linear(input_dim, forecast_horizon) for _ in range(initial_experts)
         ])
 
-        # For Experiment 1: Logging expert births
         self.birth_log = []
 
     def _spawn_new_expert(self, bmu_idx: int, timestamp: pd.Timestamp, trigger_input: np.array):
-        """
-        Adds a new expert to the ensemble and logs the birth event.
-
-        Args:
-            bmu_idx (int): The index of the BMU that triggered the novelty event.
-            timestamp (pd.Timestamp): The timestamp of the data that triggered the birth.
-            trigger_input (np.array): The input sequence that was flagged as novel.
-        """
+        """Adds a new expert to the ensemble and logs the birth event."""
         new_node_idx = self.dynamic_som.add_node(bmu_idx)
-
         device = next(self.parameters()).device
         new_expert = nn.Linear(self.input_dim, self.forecast_horizon).to(device)
         self.experts.append(new_expert)
 
-        # Log the event
         self.birth_log.append({
-            "timestamp": timestamp,
-            "new_expert_id": new_node_idx,
-            "spawned_from_expert_id": bmu_idx,
-            "trigger_input_sample": trigger_input
+            "timestamp": timestamp, "new_expert_id": new_node_idx,
+            "spawned_from_expert_id": bmu_idx, "trigger_input_sample": trigger_input
         })
-
         assert len(self.experts) == self.dynamic_som.num_nodes, "Expert count mismatch!"
 
-    def forward(self, x: torch.Tensor, timestamp: pd.Timestamp = None) -> torch.Tensor:
+    def check_and_adapt(self, forecast_error: float, x: torch.Tensor, timestamp: pd.Timestamp):
         """
-        The forward pass for a single time step's input sequence.
+        Checks for novelty using the FDD and adapts the model if necessary.
+        This is called from the main evaluation loop.
+        """
+        if self.fdd.check_novelty(forecast_error):
+            x_numpy = x.detach().cpu().numpy().flatten()
+            bmu_to_spawn_from = self.dynamic_som.find_bmu(x_numpy)
+            self._spawn_new_expert(bmu_to_spawn_from, timestamp, x_numpy)
 
-        Args:
-            x (torch.Tensor): A single input sequence, shape (1, input_dim).
-            timestamp (pd.Timestamp): The timestamp of the current input, for logging.
-
-        Returns:
-            torch.Tensor: The forecast from the selected expert.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        The forward pass now only handles forecasting, not adaptation.
         """
         if x.dim() > 2:
             x = x.view(x.size(0), -1)
 
         x_numpy = x.detach().cpu().numpy().flatten()
-
-        # 1. Check for novelty
-        if self.novelty_detector.check_novelty(x):
-            bmu_to_spawn_from = self.dynamic_som.find_bmu(x_numpy)
-            self._spawn_new_expert(bmu_to_spawn_from, timestamp, x_numpy)
-
-        # 2. Find the current regime (BMU)
         bmu_idx = self.dynamic_som.find_bmu(x_numpy)
-
-        # 3. Select the corresponding expert
         active_expert = self.experts[bmu_idx]
-
-        # 4. Generate forecast
         forecast = active_expert(x)
 
         return forecast
-
-    def train_novelty_detector(self, data_loader, epochs=5):
-        """
-        Convenience method to train the internal novelty detector.
-        """
-        self.novelty_detector.train_autoencoder(data_loader, epochs=epochs)
 
     def get_bmu_and_update_som(self, x: torch.Tensor, epoch: int, max_epochs: int) -> int:
         """
@@ -110,3 +75,70 @@ class DriftNet(nn.Module):
         bmu_idx = self.dynamic_som.find_bmu(x_numpy)
         self.dynamic_som.update(x_numpy, bmu_idx, epoch, max_epochs)
         return bmu_idx
+
+    def _merge_experts(self, eps: float = 0.5, min_samples: int = 2):
+        """
+        Finds and merges experts that have become redundant (i.e., their weight
+        vectors are very similar).
+
+        Args:
+            eps (float): The maximum distance between two samples for one to be
+                         considered as in the neighborhood of the other (for DBSCAN).
+            min_samples (int): The number of samples in a neighborhood for a point
+                               to be considered as a core point.
+        """
+        if len(self.experts) <= min_samples:
+            return # Not enough experts to merge
+
+        print(f"Running expert merging check on {len(self.experts)} experts...")
+
+        # Get all expert weight vectors
+        expert_weights = np.array([exp.weight.detach().cpu().numpy().flatten() for exp in self.experts])
+
+        # Use DBSCAN to find clusters of similar experts
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(expert_weights)
+        labels = clustering.labels_
+
+        # Find clusters (label > -1)
+        unique_labels = set(labels)
+        unique_labels.discard(-1) # -1 is for noise points, not a cluster
+
+        if not unique_labels:
+            print("No clusters found to merge.")
+            return
+
+        experts_to_remove = []
+        for k in unique_labels:
+            cluster_indices = list(np.where(labels == k)[0])
+            print(f"Found cluster of {len(cluster_indices)} experts to merge: {cluster_indices}")
+
+            # 1. Create a new merged expert (average the weights and biases)
+            avg_weight = torch.mean(torch.stack([self.experts[i].weight for i in cluster_indices]), dim=0)
+            avg_bias = torch.mean(torch.stack([self.experts[i].bias for i in cluster_indices]), dim=0)
+
+            merged_expert = nn.Linear(self.input_dim, self.forecast_horizon)
+            merged_expert.weight = nn.Parameter(avg_weight)
+            merged_expert.bias = nn.Parameter(avg_bias)
+
+            # 2. Add the new merged expert to the ensemble
+            self.experts.append(merged_expert.to(next(self.parameters()).device))
+
+            # 3. Average the SOM node weights and positions for the merged cluster
+            avg_som_weight = np.mean([self.dynamic_som.codebook[i] for i in cluster_indices], axis=0)
+            avg_som_position = np.mean([self.dynamic_som.positions[i] for i in cluster_indices], axis=0)
+            self.dynamic_som.codebook.append(avg_som_weight)
+            self.dynamic_som.positions.append(avg_som_position)
+            self.dynamic_som.num_nodes += 1
+
+            # 4. Mark the old experts for removal
+            experts_to_remove.extend(cluster_indices)
+
+        # 5. Remove the old experts and SOM nodes
+        # We must iterate backwards to not mess up the indices
+        for i in sorted(list(set(experts_to_remove)), reverse=True):
+            del self.experts[i]
+            del self.dynamic_som.codebook[i]
+            del self.dynamic_som.positions[i]
+            self.dynamic_som.num_nodes -= 1
+
+        print(f"Merging complete. New expert count: {len(self.experts)}")

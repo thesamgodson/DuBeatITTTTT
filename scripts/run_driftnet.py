@@ -5,21 +5,21 @@ import torch.nn as nn
 import torch.optim as optim
 import sys
 import os
+from sklearn.preprocessing import StandardScaler
 
-# Add the src directory to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.data_processing.data_loader import load_bitcoin_data
 from src.data_processing.macro_loader import get_google_trends_data
 from src.driftnet.model import DriftNet
+from src.driftnet.causal import get_causal_features_lasso
 from src.evaluation import FinancialMetricsEvaluator
 
 def create_sequences(data, sequence_length, forecast_horizon):
-    """Creates sequences from the input data."""
     X, y = [], []
     for i in range(len(data) - sequence_length - forecast_horizon + 1):
         X.append(data[i:(i + sequence_length)])
-        y.append(data[(i + sequence_length):(i + sequence_length + forecast_horizon), 0]) # Target is 'Close'
+        y.append(data[(i + sequence_length):(i + sequence_length + forecast_horizon), 0])
     return np.array(X), np.array(y)
 
 def main():
@@ -27,151 +27,126 @@ def main():
     print("Loading all data sources...")
     btc_df = load_bitcoin_data(start_date='2020-01-01', end_date='2024-12-31')
     trends_df = get_google_trends_data(['bitcoin'], '2020-01-01', '2024-12-31')
+    if btc_df.empty or trends_df.empty: return
 
-    if btc_df.empty or trends_df.empty:
-        print("Failed to load initial data. Exiting.")
-        return
-
-    # Ensure index is a clean DatetimeIndex before joining
-    btc_df.index = pd.to_datetime(btc_df.index, utc=True)
-    trends_df.index = pd.to_datetime(trends_df.index, utc=True)
-
-    # Merge dataframes
     full_df = btc_df.join(trends_df, how='outer').ffill()
     full_df.sort_index(inplace=True)
     full_df.dropna(inplace=True)
 
     feature_cols = ['Close', 'Volume', 'bitcoin']
-
-    # Normalize features
-    from sklearn.preprocessing import MinMaxScaler
-    scaler = MinMaxScaler()
-    full_df[feature_cols] = scaler.fit_transform(full_df[feature_cols])
-
-    print("Data loaded and prepared.")
+    target_col = 'Close'
 
     # --- 2. Rolling Window Evaluation ---
     start_date = full_df.index.min()
     end_date = full_df.index.max()
-
     train_window = pd.DateOffset(months=6)
-    test_window = pd.DateOffset(months=2) # Increased to 2 months
-
+    test_window = pd.DateOffset(months=2)
     current_date = start_date
 
-    all_results = []
-    expert_counts = []
-    feature_importance_log = []
+    all_sharpe_ratios, expert_counts, causal_feature_log, fdd_alarm_log = [], [], [], []
 
-    # We initialize the model once, and it evolves over the windows.
-    # This is a more realistic simulation of a live model.
+    sequence_length, forecast_horizon = 30, 5
     initial_train_df = full_df.loc[start_date : start_date + train_window]
-    X_initial, _ = create_sequences(initial_train_df[feature_cols].values, 30, 5)
+    X_initial, _ = create_sequences(initial_train_df[feature_cols].values, sequence_length, forecast_horizon)
     input_dim = X_initial.shape[1] * X_initial.shape[2]
-    # Using a calibrated threshold.
-    model = DriftNet(input_dim=input_dim, forecast_horizon=5, novelty_threshold=2.0)
+    model = DriftNet(input_dim=input_dim, forecast_horizon=forecast_horizon)
     evaluator = FinancialMetricsEvaluator()
+    consecutive_fdd_alarms, merge_counter = 0, 0
 
     while current_date + train_window + test_window <= end_date:
-        train_start = current_date
-        train_end = current_date + train_window
-        test_end = train_end + test_window
-
+        train_start, train_end, test_end = current_date, current_date + train_window, current_date + train_window + test_window
         print(f"\n{'='*20} Running Window: {train_start.date()} to {test_end.date()} {'='*20}")
 
-        # --- Get data for the current window ---
-        train_df = full_df.loc[train_start:train_end]
-        test_df = full_df.loc[train_end:test_end]
+        train_df_unscaled = full_df.loc[train_start:train_end]
 
-        X_train, y_train = create_sequences(train_df[feature_cols].values, 30, 5)
-        X_test, y_test = create_sequences(test_df[feature_cols].values, 30, 5)
+        feature_scaler = StandardScaler()
+        target_scaler = StandardScaler()
+        train_df_scaled = train_df_unscaled.copy()
+        train_df_scaled[feature_cols] = feature_scaler.fit_transform(train_df_unscaled[feature_cols])
+        target_scaler.fit(train_df_unscaled[[target_col]])
 
-        if len(X_train) == 0 or len(X_test) == 0:
-            print("Not enough data in this window. Skipping.")
+        X_train, y_train = create_sequences(train_df_scaled[feature_cols].values, sequence_length, forecast_horizon)
+
+        if len(X_train) == 0:
             current_date += test_window
             continue
 
-        # --- Train Model on Current Window ---
-        print(f"Training DriftNet on data from {train_start.date()} to {train_end.date()}...")
+        selected_features = get_causal_features_lasso(X_train, y_train, feature_cols)
+        causal_feature_log.append({"window_end": train_end.date(), "selected_features": selected_features})
 
-        # Pre-train novelty detector on the new training data
-        train_tensor_dataset = torch.utils.data.TensorDataset(torch.from_numpy(X_train).float())
-        train_loader = torch.utils.data.DataLoader(train_tensor_dataset, batch_size=32)
-        model.train_novelty_detector(train_loader, epochs=5)
-
+        print("Training DriftNet...")
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.MSELoss()
-
-        for epoch in range(10):
+        for epoch in range(5):
             for i in range(len(X_train)):
                 x_i = torch.from_numpy(X_train[i]).float().view(1, -1)
                 y_i = torch.from_numpy(y_train[i]).float().view(1, -1)
-                bmu_idx = model.get_bmu_and_update_som(x_i, epoch, 10)
+                bmu_idx = model.get_bmu_and_update_som(x_i, epoch, 5)
                 optimizer.zero_grad()
                 y_pred = model.experts[bmu_idx](x_i)
                 loss = criterion(y_pred, y_i)
                 loss.backward()
                 optimizer.step()
 
-        # --- Evaluation on Test Set (with novelty detection) ---
-        print(f"Evaluating on test set from {train_end.date()} to {test_end.date()}...")
+        print("Evaluating on test set...")
         model.eval()
-        predictions = []
+        test_df_unscaled = full_df.loc[train_end:test_end]
+        test_df_scaled_values = feature_scaler.transform(test_df_unscaled[feature_cols])
+        X_test, y_test = create_sequences(test_df_scaled_values, sequence_length, forecast_horizon)
+
+        predictions_scaled, forecast_errors = [], []
         with torch.no_grad():
             for i in range(len(X_test)):
                 x_i = torch.from_numpy(X_test[i]).float().view(1, -1)
-                current_sample_date = test_df.index[i + 30 - 1]
-                y_pred = model(x_i, current_sample_date)
-                predictions.append(y_pred.numpy())
+                y_i_true_scaled = torch.from_numpy(y_test[i]).float().view(1, -1)
+                y_pred_scaled = model(x_i)
+                predictions_scaled.append(y_pred_scaled.numpy())
+                error = criterion(y_pred_scaled, y_i_true_scaled).item()
+                forecast_errors.append(error)
 
-        # --- Financial Evaluation for this window ---
-        # 1. Get the last known price from each sequence in the test set
-        last_prices_scaled = X_test[:, -1, 0] # Last day, 'Close' feature
+        avg_window_error = np.mean(forecast_errors) if forecast_errors else 0
+        if model.fdd.check_novelty(avg_window_error):
+            fdd_alarm_log.append({"timestamp": test_end.date(), "avg_forecast_error": avg_window_error})
+            consecutive_fdd_alarms += 1
+        else:
+            consecutive_fdd_alarms = 0
 
-        # 2. The model predicts the price for the NEXT step. We take the first step.
-        y_pred_scaled = np.array(predictions)[:, 0, 0]
+        if consecutive_fdd_alarms >= 3:
+            print(f"--- FORECAST CRISIS! Spawning new expert. ---")
+            last_x_numpy = X_test[-1].flatten()
+            bmu = model.dynamic_som.find_bmu(last_x_numpy)
+            model._spawn_new_expert(bmu, test_end.date(), last_x_numpy)
+            consecutive_fdd_alarms = 0
 
-        # 3. Generate directional signals (1 for up, 0 for down)
-        signals = (y_pred_scaled > last_prices_scaled).astype(int)
+        merge_counter += 1
+        if merge_counter >= 6:
+            model._merge_experts()
+            merge_counter = 0
 
-        # 4. Get the *actual* returns from the unscaled dataframe for the test period
-        # The first return corresponds to the first prediction
-        actual_returns_unscaled = full_df['Close'].pct_change().loc[test_df.index].values[30:]
+        # --- Financial Evaluation ---
+        predictions_unscaled = target_scaler.inverse_transform(np.array(predictions_scaled).reshape(-1, forecast_horizon))
 
-        # 5. Ensure lengths match
-        min_len = min(len(signals), len(actual_returns_unscaled))
+        last_prices_unscaled = test_df_unscaled[target_col].values[sequence_length-1:-forecast_horizon]
 
-        metrics = evaluator.calculate_all_metrics(
-            predictions=signals[:min_len],
-            actual_returns=actual_returns_unscaled[:min_len]
-        )
-        sharpe = metrics.get('sharpe_ratio', 0)
-        print(f"Test Sharpe Ratio for this window: {sharpe:.4f}")
-        all_results.append(sharpe)
+        # We use the first step of the forecast for our signal
+        signals = (predictions_unscaled[:, 0] > last_prices_unscaled).astype(int)
+
+        # The actual return is the return of the day we are predicting
+        actual_returns = test_df_unscaled[target_col].pct_change().values[sequence_length:]
+
+        min_len = min(len(signals), len(actual_returns))
+        metrics = evaluator.calculate_all_metrics(predictions=signals[:min_len], actual_returns=actual_returns[:min_len])
+        all_sharpe_ratios.append(metrics.get('sharpe_ratio', 0))
         expert_counts.append(model.dynamic_som.num_nodes)
-
-        # --- Log Feature Importance for this window ---
-        num_features = len(feature_cols)
-        seq_len = 30
-        for expert_id, expert in enumerate(model.experts):
-            weights = expert.weight.detach().cpu().numpy()
-            weights_reshaped = weights.reshape(-1, seq_len, num_features)
-            for i, feature_name in enumerate(feature_cols):
-                feature_importance = np.mean(np.abs(weights_reshaped[:, :, i]))
-                feature_importance_log.append({
-                    "window_end_date": train_end.date(),
-                    "expert_id": expert_id,
-                    "feature": feature_name,
-                    "importance": feature_importance
-                })
 
         current_date += test_window
 
     # --- Final Report and Saving Artifacts ---
     print("\n\n" + "="*60)
-    print("           DRIFTNET ROLLING EVALUATION REPORT")
+    print("           DRIFTNET v0.2 ROLLING EVALUATION REPORT")
     print("="*60)
-    print(f"Average Test Sharpe Ratio across all windows: {np.mean(all_results):.4f}")
+    print(f"Average Sharpe Ratio across all windows: {np.mean(all_sharpe_ratios):.4f}")
+    print(f"Standard Deviation of Sharpe Ratio: {np.std(all_sharpe_ratios):.4f}")
     print(f"Expert counts per window: {expert_counts}")
     if expert_counts:
         print(f"Final number of experts: {expert_counts[-1]}")
@@ -182,10 +157,14 @@ def main():
         birth_log_df = pd.DataFrame(model.birth_log)
         birth_log_df.to_csv('results/expert_birth_log.csv', index=False)
         print("\nExpert birth log saved to 'results/expert_birth_log.csv'")
-    if feature_importance_log:
-        importance_df = pd.DataFrame(feature_importance_log)
-        importance_df.to_csv('results/expert_feature_importance.csv', index=False)
-        print("Feature importance log saved to 'results/expert_feature_importance.csv'")
+    if causal_feature_log:
+        causal_df = pd.DataFrame(causal_feature_log)
+        causal_df.to_csv('results/causal_feature_log.csv', index=False)
+        print("Causal feature log saved to 'results/causal_feature_log.csv'")
+    if fdd_alarm_log:
+        fdd_df = pd.DataFrame(fdd_alarm_log)
+        fdd_df.to_csv('results/fdd_alarm_log.csv', index=False)
+        print("FDD alarm log saved to 'results/fdd_alarm_log.csv'")
 
 if __name__ == "__main__":
     main()
